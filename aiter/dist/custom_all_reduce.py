@@ -64,7 +64,9 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=8192 * 1024 * 8,
+        # max_size=8192 * 1024 * 8 + 1,
+        max_size=1024 * 1024 * 1024,
+
     ) -> None:
         """
         Args:

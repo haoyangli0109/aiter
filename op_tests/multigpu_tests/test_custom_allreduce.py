@@ -138,5 +138,5 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
-            # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
+            # test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
+            test_allreduce_custom(8, 1, shape, dtype, withGraph=False)

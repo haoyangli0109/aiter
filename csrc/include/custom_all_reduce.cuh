@@ -33,7 +33,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include "communication_asm.h"
 #include "hip_float8.h"
 #include "ck_tile/core.hpp"
-
+#define caltime
 #define CUDACHECK(cmd)                                              \
   do                                                                \
   {                                                                 \
@@ -412,25 +412,50 @@ namespace aiter
                                  Signal *self_sg,
                                  T *__restrict__ result, int rank, int size)
   {
+/*
+  // like std::array, but aligned
+        template <typename T, int sz>
+        struct __align__(alignof(T) * sz) array_t
+        {
+          T data[sz];
+          using type = T;
+          static constexpr int size = sz;
+        };
+  // use packed type to maximize memory efficiency
+  // goal: generate ld.128 and st.128 instructions
+        template <typename T>
+        struct packed_t
+        {
+          // the (P)acked type for load/store
+          using P = array_t<T, 16 / sizeof(T)>;
+          // the (A)ccumulator type for reduction
+          using A = array_t<float, 16 / sizeof(T)>;
+        };
+*/
     using P = typename packed_t<T>::P;
     using A = typename packed_t<T>::A;
-    constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = 512 / ngpus;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    constexpr int pack_size = packed_t<T>::P::size; // 8
+    constexpr int tnum_gpu = 512 / ngpus; // 512是整个block总共支持的线程数
+    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size]; // 512 * 8个值
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
     auto dp = *_dp;
 
     // load one gpu data each wave
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
+    int warp_id = threadIdx.x / tnum_gpu; // 线程至多512个，512/(512/ngpus) = ngpus
+    int lane_id = threadIdx.x % tnum_gpu; // 512 %（512 / 2）这样线程就根据gpu的区别进一步区分开来，比如俩GPU，gpu0和gpu1都有线程120
     start_sync<ngpus>(sg, self_sg, rank);
     // do the actual reduction
     for (int idx = blockIdx.x * tnum_gpu + lane_id; idx < size;
-         idx += gridDim.x * tnum_gpu)
+         idx += gridDim.x * tnum_gpu) 
+    // 从for得知，每个block要处理tnum_gpu个pack数据，实际原本是要处理512个packed的数据的;
+    // 以前是等于是一次block的所有512线程，每个线程都取数一个packed,能计算data的512个pack
+    // 现在是一次block的所有512线程，前256线程，每个取gpu0的一个packed，后256取gpu1的256个packed，能计算data的256个pack
+    // 好处是大大减少了取数操作，坏处是block要多来一遍
     {
+      // 0-256取gpu0 , 256-512取gpu1
       *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ((const P**)&dp.ptrs[0])[warp_id][idx];
-      __syncthreads();
+      __syncthreads(); // warp_id == 1也做完了
       if (warp_id == 0)
       {
         A add_reg;
@@ -1032,17 +1057,34 @@ namespace aiter
     template <typename T>
     void runFp8QuantKernel(cudaStream_t stream, T* input, T* output, int size)
     {
+      auto bytes = size * sizeof(T);
       RankData *ptrs = get_buffer_RD(stream, input);
       // 32 block 512 thread or 64 block 256 thread
-#define DISPATHC_UNIT(pack_size, quant_scale, ngpus)                                                                             \
-  do                                                                                                                             \
-  {                                                                                                                              \
-    case ngpus:                                                                                                                  \
-    {                                                                                                                            \
-      allReduceQuantFp8<T, quant_scale, pack_size, ngpus><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
-      return ;                                                                                                                   \
-    }                                                                                                                            \
-  }while(0)
+#define DISPATHC_UNIT(pack_size, quant_scale, ngpus)                                                                                \
+  do                                                                                                                                \
+  {                                                                                                                                 \
+    case ngpus:                                                                                                                     \
+    {                                                                                                                               \
+      hipEvent_t start, end;                                                                                                        \
+      hipEventCreate(&start);                                                                                                       \
+      hipEventCreate(&end);                                                                                                         \
+      hipEventRecord(start, stream);                                                                                                \
+                                                                                                                                    \
+      allReduceQuantFp8<T, quant_scale, pack_size, ngpus><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);    \
+                                                                                                                                    \
+      hipEventRecord(end, stream);                                                                                                  \
+      hipEventSynchronize(end);                                                                                                     \
+      float elapsed;                                                                                                                \
+      hipEventElapsedTime(&elapsed, start, end);                                                                                    \
+      if (rank_ == 0) {                                                                                                             \
+      printf("msg_size:%u, quant_level:fp8, at_latency:%f\n", bytes, elapsed * 1000);                                          \
+      }                                                                                                                             \
+      hipEventDestroy(start);                                                                                                       \
+      hipEventDestroy(end);                                                                                                         \
+      return;                                                                                                                       \
+    }                                                                                                                               \
+  } while (0)
+
 
 #define DISPATCH_CALL(pack_size, block_size, quant_scale)                                \
   do                                                                                     \
@@ -1173,7 +1215,12 @@ namespace aiter
     }                                              \
     break;                                         \
   }
-
+#ifdef caltime
+hipEvent_t start, end;
+hipEventCreate(&start);
+hipEventCreate(&end);
+hipEventRecord(start, stream);
+#endif
     switch (world_size_)
     {
       REDUCE_CASE(2)
@@ -1186,6 +1233,15 @@ namespace aiter
           "gpus = " +
           std::to_string(world_size_));
     }
+#ifdef caltime
+hipEventRecord(end, stream);
+hipEventSynchronize(end);
+float elapsed_time;
+hipEventElapsedTime(&elapsed_time, start, end);
+if (rank_ == 0) {
+printf("msg_size:%u, quant_level:NONE, at_latency:%f\n", bytes, elapsed_time * 1000);
+}
+#endif
 #undef REDUCE_CASE
 #undef KL
   }

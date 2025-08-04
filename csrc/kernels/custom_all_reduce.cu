@@ -146,7 +146,8 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
               "registered buffer is too small to contain the input");
   AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
                                 input_size, cudaMemcpyDeviceToDevice, stream));
-  _all_reduce(_fa, reg_buffer, out, stream, false);
+  _all_reduce(_fa, reg_buffer, out, stream, true);
+  // _all_reduce(_fa, reg_buffer, out, stream, false);
 }
 
 void dispose(fptr_t _fa)
