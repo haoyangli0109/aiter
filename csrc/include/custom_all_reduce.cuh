@@ -782,38 +782,38 @@ namespace aiter
     float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
-    using inp_pack = array_t<T, pack_size>;
-    using fp8_pack = array_t<hip_fp8, pack_size>;
+    using inp_pack = array_t<T, pack_size>; // pack_size==8, 相当于原来的P
+    using fp8_pack = array_t<hip_fp8, pack_size>; // 这里是一字节，8个数
     int part = size / ngpus;
     int start = rank * part;
     int end = rank == ngpus - 1 ? size : start + part;
     int largest_part = part + size % ngpus;
-    const inp_pack *ptrs[ngpus];
-    fp8_pack *tmps[ngpus];
+    const inp_pack *ptrs[ngpus]; // 每个元素都是inp_pack*，指向inp_pack的指针
+    fp8_pack *tmps[ngpus]; // 每个元素都是指向fp8_pack的指针
 #pragma unroll
     for (int i = 0; i < ngpus; i++)
     {
-      int target = (rank + i) % ngpus;
+      int target = (rank + i) % ngpus; // 每个rank都算，对rank0：0,1,2,3; 对rank1: 1,2,3,0; 对rank2：2,3,0,1
       ptrs[i] = (const inp_pack *)_dp->ptrs[target];
-      tmps[i] = get_tmp_buf<fp8_pack>(sg.signals[target]);
+      tmps[i] = get_tmp_buf<fp8_pack>(sg.signals[target]); // 把当前rank的tmp_buf解释为fp8_pack类型的指针
     }
-    auto tmp_out = tmps[0];
+    auto tmp_out = tmps[0]; // 这是是本rank的tmp_buf, 拿出来用
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
     for (int idx = start + tid; idx < end; idx += stride)
     {
       inp_pack half8_reg;
       // half8_reg = packed_reduce<P, ngpus, A>(ptrs, idx);
-      half8_reg = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);
-      ((inp_pack *)result)[idx] = half8_reg;
+      half8_reg = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);// 本rank分配的数据段的索引， 直接在这就遍历gpu完成加法
+      ((inp_pack *)result)[idx] = half8_reg; // 这段自己的就直接给放进去了，因为不涉及跨gpu，直接放进去就好了，其余片段才涉及P2P
       // quant
-      T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
-      thread_max = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
+      T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg); // pick_size=8, 8个数值的最大值
+      thread_max = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max); // 128个数值中的最大值，也就是16个pack_里面最大的那个;__shfl_xor这个操作不需要阻塞很神奇
       T scale_factor = ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
-      tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
+      tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);// 量化之后直接存到tmp_buf,这里是8bits对齐的
       if (threadIdx.x % (quant_scale / pack_size) == 0)
       {
-        *(reinterpret_cast<T*>(&tmp_out[part]) + (idx - start) / (quant_scale / pack_size)) = scale_factor;
+        *(reinterpret_cast<T*>(&tmp_out[part]) + (idx - start) / (quant_scale / pack_size)) = scale_factor;//在part之外依次存放scale，待会访存的时候会不会有overhead
       }
     }
     end_sync<ngpus>(sg, self_sg, rank);
@@ -822,7 +822,7 @@ namespace aiter
     for (int idx = tid; idx < largest_part; idx += stride)
     {
 #pragma unroll
-      for (int i = 1; i < ngpus; i++)
+      for (int i = 1; i < ngpus; i++) //本rank的在上面已经存过了，不必管了
       {
         int gather_from_rank = ((rank + i) % ngpus);
         if (gather_from_rank == ngpus - 1 || idx < part)
@@ -832,9 +832,9 @@ namespace aiter
           int factor_stride = quant_scale / pack_size;
           if (threadIdx.x % factor_stride == 0)
           {
-            scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
+            scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);//如果当前线程来到了下一个stride，就取一次scale
           }
-          scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+          scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);//16个线程一组，那么这就取值为0，16，32
           inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
           int dst_idx = gather_from_rank * part + idx;
           ((inp_pack *)result)[dst_idx] = half8_reg;
@@ -1242,6 +1242,7 @@ if (rank_ == 0) {
 printf("msg_size:%u, quant_level:NONE, at_latency:%f\n", bytes, elapsed_time * 1000);
 }
 #endif
+
 #undef REDUCE_CASE
 #undef KL
   }

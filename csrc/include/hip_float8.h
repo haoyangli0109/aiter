@@ -12,67 +12,70 @@
 
 #include "hip_float8_impl.h"
 
-struct alignas(1) hip_fp8  // 定义一个结构体 hip_fp8，要求按1字节对齐
+struct alignas(1) hip_fp8
 {
-  struct from_bits_t {};  // 声明一个空结构体 from_bits_t，作为特殊构造函数的标志
-
-  HIP_FP8_HOST_DEVICE static constexpr from_bits_t from_bits()  // 静态函数返回一个 from_bits_t 对象，用于构造器标志
+  struct from_bits_t
   {
-    return from_bits_t();  // 返回空对象
+  };
+  HIP_FP8_HOST_DEVICE static constexpr from_bits_t from_bits()
+  {
+    return from_bits_t();
   }
+  uint8_t data;
 
-  uint8_t data;  // 实际存储的 FP8 原始数据（1字节）
-
-  hip_fp8() = default;  // 默认构造函数
-
-  HIP_FP8_HOST_DEVICE constexpr hip_fp8(const hip_fp8 &) = default;  // 拷贝构造函数
-
-  HIP_FP8_HOST_DEVICE constexpr hip_fp8(uint8_t v) = delete;  // 禁止通过 uint8_t 直接构造（防止误用）
-
+  hip_fp8() = default;
+  HIP_FP8_HOST_DEVICE constexpr hip_fp8(const hip_fp8 &) = default;
+  HIP_FP8_HOST_DEVICE constexpr hip_fp8(uint8_t v) = delete;
   explicit HIP_FP8_HOST_DEVICE constexpr hip_fp8(uint8_t v, from_bits_t)
-      : data(v) {}  // 允许通过 uint8_t 和 from_bits_t 标志构造，用于从原始比特初始化
+      : data(v) {}
 
 #ifdef __HIP__MI300__
+  // NOTE: ON-DEVICE... always optimal bias
   explicit HIP_FP8_DEVICE hip_fp8(float v)
-      : data(hip_fp8_impl::to_fp8_from_fp32(v)) {}  // MI300设备上：从 float 构造 FP8，调用设备函数转换
+      : data(hip_fp8_impl::to_fp8_from_fp32(v)) {}
 
   explicit HIP_FP8_DEVICE hip_fp8(_Float16 v)
-      : hip_fp8(static_cast<float>(v)) {}  // 从 _Float16 构造，先转换为 float
+      : hip_fp8(static_cast<float>(v)) {}
 
+  // Host only implementation using s/w simulation
   explicit HIP_FP8_HOST
-#else
+#else  // __HIP__MI300__
+  // both Host and DEVICE for non-MI300 using s/w simulation
   explicit HIP_FP8_HOST_DEVICE
-#endif
+#endif // __HIP__MI300__
   hip_fp8(float v)
   {
-    data = hip_fp8_impl::to_float8<4, 3, float, true, true>(v);  // 非 MI300 上：用模拟方式转换 float 到 FP8
+    data = hip_fp8_impl::to_float8<4, 3, float, true /*negative_zero_nan*/,
+                                   true /*clip*/>(v);
   }
 
   explicit HIP_FP8_HOST_DEVICE hip_fp8(double v)
-      : hip_fp8(static_cast<float>(v)) {}  // 从 double 构造，先转成 float，再转成 fp8
+      : hip_fp8(static_cast<float>(v)) {}
 
 #ifdef __HIP__MI300__
+  // upcast using device specific intrinsic
   explicit inline HIP_FP8_DEVICE operator float() const
   {
     float fval;
-    uint32_t i32val = static_cast<uint32_t>(data);  // 将 data 转为 32 位整数以用于汇编
+    uint32_t i32val = static_cast<uint32_t>(data);
 
+    // upcast
     asm volatile("v_cvt_f32_fp8 %0, %1 src0_sel:BYTE_0"
                  : "=v"(fval)
-                 : "v"(i32val));  // 使用汇编指令将 FP8 转 float
+                 : "v"(i32val));
 
     return fval;
   }
 
   explicit inline HIP_FP8_HOST operator float() const
-#else
+#else  // __HIP__MI300__
   explicit inline HIP_FP8_HOST_DEVICE operator float() const
-#endif
+#endif // __HIP__MI300__
   {
-    return hip_fp8_impl::from_float8<4, 3, float, true>(data);  // 非 MI300 上：使用软件模拟方式转成 float
+    return hip_fp8_impl::from_float8<4, 3, float, true /*negative_zero_nan*/>(
+        data);
   }
 };
-
 
 namespace std
 {
